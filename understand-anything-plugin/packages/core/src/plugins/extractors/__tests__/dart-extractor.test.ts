@@ -328,6 +328,44 @@ describe("DartExtractor", () => {
     });
   });
 
+  describe("extractCallGraph", () => {
+    it("attributes a top-level call to its enclosing function", () => {
+      const { tree, parser, root } = parse(`int helper() => 1;
+int caller() {
+  return helper();
+}
+`);
+      const entries = extractor.extractCallGraph(root);
+
+      const helperCall = entries.find((e) => e.callee === "helper");
+      expect(helperCall).toBeDefined();
+      expect(helperCall!.caller).toBe("caller");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("attributes a method call (x.foo()) to its enclosing function", () => {
+      const { tree, parser, root } = parse(`void run() {
+  "hi".toUpperCase();
+}
+`);
+      const entries = extractor.extractCallGraph(root);
+
+      const callees = entries.map((e) => e.callee);
+      expect(callees).toContain("toUpperCase");
+      tree.delete();
+      parser.delete();
+    });
+
+    it("returns an empty array when there are no calls", () => {
+      const { tree, parser, root } = parse(`int a() => 1;\n`);
+      const entries = extractor.extractCallGraph(root);
+      expect(entries).toEqual([]);
+      tree.delete();
+      parser.delete();
+    });
+  });
+
   describe("extractStructure - visibility", () => {
     it("does NOT export a top-level declaration whose name starts with _", () => {
       const { tree, parser, root } = parse(`int _helper() => 1;

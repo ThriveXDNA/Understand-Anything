@@ -480,8 +480,139 @@ export class DartExtractor implements LanguageExtractor {
   }
 
   extractCallGraph(rootNode: TreeSitterNode): CallGraphEntry[] {
-    // Implementation lands in a later task.
-    void rootNode;
-    return [];
+    const entries: CallGraphEntry[] = [];
+    const functionStack: string[] = [];
+
+    /**
+     * Walk a single node, recursing into its children. Detects call sites
+     * (selector nodes containing argument_part) and records them against the
+     * current function on the stack.
+     *
+     * In Dart's AST, `function_signature` and `function_body` are SIBLINGS
+     * within their parent (program, class_body, etc.), NOT parent/child. This
+     * differs from Kotlin where `function_declaration` wraps both signature and
+     * body. We handle this by scanning siblings at the parent level:
+     * `walkSiblings` iterates the children of a container, remembers the name
+     * from each `function_signature` / `method_signature`, and pushes it onto
+     * the stack only for the duration of the following `function_body`.
+     */
+    const walkNode = (node: TreeSitterNode) => {
+      if (
+        node.type === "selector" &&
+        findChild(node, "argument_part") &&
+        functionStack.length > 0
+      ) {
+        // A call site: selector containing argument_part.
+        const callee = this.extractCalleeName(node);
+        if (callee) {
+          entries.push({
+            caller: functionStack[functionStack.length - 1],
+            callee,
+            lineNumber: node.startPosition.row + 1,
+          });
+        }
+      }
+      walkSiblings(node);
+    };
+
+    /**
+     * Iterate a node's children, pairing each function_signature /
+     * method_signature with its subsequent function_body sibling.
+     */
+    const walkSiblings = (parent: TreeSitterNode) => {
+      let pendingName: string | null = null;
+
+      for (let i = 0; i < parent.childCount; i++) {
+        const child = parent.child(i);
+        if (!child) continue;
+
+        if (child.type === "function_signature") {
+          pendingName = extractFunctionName(child);
+          // Recurse into signature (no calls expected, but stay complete).
+          walkSiblings(child);
+        } else if (child.type === "method_signature") {
+          // method_signature wraps function_signature; sibling function_body follows.
+          const inner = findChild(child, "function_signature");
+          if (inner) pendingName = extractFunctionName(inner);
+          walkSiblings(child);
+        } else if (child.type === "function_body") {
+          // Consume pendingName: push for the duration of this body.
+          const pushed = pendingName !== null;
+          if (pendingName) {
+            functionStack.push(pendingName);
+            pendingName = null;
+          }
+          walkNode(child);
+          if (pushed) functionStack.pop();
+        } else {
+          // For every other node (including selector nodes at this level),
+          // do NOT clear pendingName — anonymous tokens (`;`, `{`, etc.)
+          // appear between the signature and body and must not reset the
+          // pending name.
+          walkNode(child);
+        }
+      }
+    };
+
+    walkSiblings(rootNode);
+    return entries;
+  }
+
+  /**
+   * Find the callee name for a `selector` node that contains an
+   * `argument_part`. Look at the parent's children:
+   *   - Bare call `foo(...)`: the previous sibling is an `identifier`.
+   *   - Method call `target.foo(...)`: the previous sibling is itself a
+   *     `selector` wrapping `unconditional_assignable_selector` with the
+   *     method-name `identifier`.
+   *
+   * Probe finding (2026-06-13): the plan's claimed AST shapes match exactly.
+   *   - Bare call:   return_statement > identifier[helper] + selector(argument_part)
+   *   - Method call: expression_statement > string_literal + selector(unconditional_assignable_selector > identifier[toUpperCase]) + selector(argument_part)
+   * The plan claimed `expression_statement` as parent for bare calls but the
+   * actual parent for `return helper()` is `return_statement`. This does not
+   * affect the strategy since we only look at the preceding sibling, not the
+   * parent type.
+   *
+   * IMPORTANT: web-tree-sitter returns a NEW wrapper object each time `.child(i)`
+   * is called — node identity (`===`) does NOT work for sibling lookup. We
+   * compare by `startIndex` (byte offset) which is stable and unique per node.
+   */
+  private extractCalleeName(callSelector: TreeSitterNode): string | null {
+    const parent = callSelector.parent;
+    if (!parent) return null;
+
+    // Find this selector's index in the parent using startIndex (not ===).
+    let myIdx = -1;
+    for (let i = 0; i < parent.childCount; i++) {
+      const c = parent.child(i);
+      if (c && c.startIndex === callSelector.startIndex) {
+        myIdx = i;
+        break;
+      }
+    }
+    if (myIdx <= 0) return null;
+
+    const prev = parent.child(myIdx - 1);
+    if (!prev) return null;
+
+    if (prev.type === "identifier") return prev.text;
+
+    if (prev.type === "selector") {
+      // Method call shape: previous selector wraps unconditional_assignable_selector.
+      const inner = findChild(prev, "unconditional_assignable_selector");
+      if (inner) {
+        // Pick the LAST identifier inside the inner selector — that's the
+        // method name (earlier identifiers, if any, are receiver fragments).
+        let last: string | null = null;
+        for (let i = 0; i < inner.childCount; i++) {
+          const child = inner.child(i);
+          if (child && child.type === "identifier") last = child.text;
+        }
+        return last;
+      }
+    }
+
+    return null;
   }
 }
